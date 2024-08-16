@@ -175,7 +175,15 @@ func generateWorkspaces(task *pipepinev1.Task, stringBuilder *strings.Builder) e
 	}
 
 	for _, workspace := range task.Spec.Workspaces {
-		_, err := stringBuilder.WriteString(fmt.Sprintf("* **%v**: %v\n", workspace.Name, workspace.Description))
+
+		var formatString string
+		if workspace.Optional {
+			formatString = "* **%v** (optional): %v\n"
+		} else {
+			formatString = "* **%v**: %v\n"
+		}
+
+		_, err := stringBuilder.WriteString(fmt.Sprintf(formatString, workspace.Name, workspace.Description))
 		if err != nil {
 			return err
 		}
