@@ -1,22 +1,23 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	pipepinev1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	"log"
 	"os"
-	"sigs.k8s.io/kustomize/api/krusty"
-	"sigs.k8s.io/kustomize/api/resmap"
-	"sigs.k8s.io/kustomize/api/resource"
-	"sigs.k8s.io/kustomize/kyaml/filesys"
+	"sigs.k8s.io/yaml"
 	"strings"
 )
 
+type TaskBundle struct {
+	path string
+	task pipepinev1.Task
+}
+
 func main() {
 	logError := log.New(os.Stderr, "", 0)
-	if len(os.Args) != 2 {
-		logError.Fatal("usage: taskmd [kustomize-dir]")
+	if len(os.Args) <= 1 {
+		logError.Fatal("usage: taskmd [task-files]")
 	}
 
 	err := run(logError)
@@ -26,16 +27,11 @@ func main() {
 }
 
 func run(logError *log.Logger) error {
-	kustomizePath := os.Args[1]
+	paths := os.Args[1:]
 
-	resourceMap, err := KustomizeBuild(kustomizePath)
+	tasks, err := LoadAllTasks(paths)
 	if err != nil {
-		logError.Fatal(err.Error())
-	}
-
-	tasks, err := GetAllTasksFromResourceMap(resourceMap)
-	if err != nil {
-		logError.Fatal(err.Error())
+		return err
 	}
 
 	err = GenerateMarkdownToDirectory(tasks)
@@ -46,90 +42,69 @@ func run(logError *log.Logger) error {
 	return nil
 }
 
-func KustomizeBuild(path string) (resmap.ResMap, error) {
-	options := krusty.MakeDefaultOptions()
-	k := krusty.MakeKustomizer(options)
-	fs := filesys.FileSystemOrOnDisk{
-		FileSystem: nil,
-	}
+func LoadAllTasks(paths []string) ([]TaskBundle, error) {
+	tasks := make([]TaskBundle, 0)
 
-	resourceMap, err := k.Run(fs, path)
-	if err != nil {
-		return nil, err
-	}
-
-	return resourceMap, nil
-}
-
-func GetAllTasksFromResourceMap(resourceMap resmap.ResMap) ([]pipepinev1.Task, error) {
-	tasks := make([]pipepinev1.Task, 0)
-
-	for _, res := range resourceMap.Resources() {
-		if res.GetKind() != "Task" {
-			return tasks, nil
+	for _, path := range paths {
+		bytes, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
 		}
 
 		var task pipepinev1.Task
-
-		err := ResourceToType(res, &task)
+		err = yaml.Unmarshal(bytes, &task)
 		if err != nil {
-			return tasks, err
+			return nil, err
 		}
 
-		tasks = append(tasks, task)
+		tasks = append(tasks, TaskBundle{
+			path: path,
+			task: task,
+		})
 	}
 
 	return tasks, nil
 }
 
-func ResourceToType[T any](resource *resource.Resource, t *T) error {
-	bytes, err := resource.MarshalJSON()
+func GenerateMarkdownToDirectory(tasks []TaskBundle) error {
+	err := os.RemoveAll("taskmd.out")
 	if err != nil {
 		return err
 	}
 
-	err = json.Unmarshal(bytes, &t)
+	err = os.MkdirAll("taskmd.out", os.ModePerm)
 	if err != nil {
 		return err
 	}
 
-	return nil
-}
-
-func GenerateMarkdownToDirectory(tasks []pipepinev1.Task) error {
-	err := os.MkdirAll("taskmd.out", os.ModePerm)
-	if err != nil {
-		return err
-	}
-
-	for _, task := range tasks {
+	for _, taskBundle := range tasks {
 		stringBuilder := strings.Builder{}
-		err = generateHeader(&task, &stringBuilder)
+		err = generateHeader(&taskBundle, &stringBuilder)
 		if err != nil {
 			return err
 		}
 
-		err = generateDescription(&task, &stringBuilder)
+		err = generateDescription(&taskBundle, &stringBuilder)
 		if err != nil {
 			return err
 		}
 
-		err = generateInputs(&task, &stringBuilder)
+		err = generateInputs(&taskBundle, &stringBuilder)
 		if err != nil {
 			return err
 		}
 
-		err = generateWorkspaces(&task, &stringBuilder)
+		err = generateWorkspaces(&taskBundle, &stringBuilder)
 		if err != nil {
 			return err
 		}
 
-		err = generateResults(&task, &stringBuilder)
+		err = generateResults(&taskBundle, &stringBuilder)
 		if err != nil {
 			return err
 		}
 
-		err = writeGenerateMarkdown(&task, &stringBuilder)
+		err = writeGenerateMarkdown(&taskBundle, &stringBuilder)
 		if err != nil {
 			return err
 		}
@@ -138,13 +113,38 @@ func GenerateMarkdownToDirectory(tasks []pipepinev1.Task) error {
 	return nil
 }
 
-func writeGenerateMarkdown(task *pipepinev1.Task, stringBuilder *strings.Builder) error {
-	file, err := os.Create(fmt.Sprintf("taskmd.out/%v.md", task.Name))
+func writeGenerateMarkdown(taskBundle *TaskBundle, stringBuilder *strings.Builder) error {
+	err := os.MkdirAll(fmt.Sprintf("taskmd.out/%v", taskBundle.task.Name), os.ModePerm)
 	if err != nil {
 		return err
 	}
 
-	_, err = file.WriteString(stringBuilder.String())
+	readmeFile, err := os.Create(fmt.Sprintf("taskmd.out/%v/README.md", taskBundle.task.Name))
+	if err != nil {
+		return err
+	}
+
+	_, err = readmeFile.WriteString(stringBuilder.String())
+	if err != nil {
+		return err
+	}
+
+	stat, err := os.Stat(taskBundle.path)
+	if err != nil {
+		return err
+	}
+
+	bytes, err := os.ReadFile(taskBundle.path)
+	if err != nil {
+		return err
+	}
+
+	taskFile, err := os.Create(fmt.Sprintf("taskmd.out/%v/%v", taskBundle.task.Name, stat.Name()))
+	if err != nil {
+		return err
+	}
+
+	_, err = taskFile.Write(bytes)
 	if err != nil {
 		return err
 	}
@@ -152,13 +152,13 @@ func writeGenerateMarkdown(task *pipepinev1.Task, stringBuilder *strings.Builder
 	return nil
 }
 
-func generateResults(task *pipepinev1.Task, stringBuilder *strings.Builder) error {
+func generateResults(taskBundle *TaskBundle, stringBuilder *strings.Builder) error {
 	_, err := stringBuilder.WriteString("## Results\n")
 	if err != nil {
 		return err
 	}
 
-	for _, result := range task.Spec.Results {
+	for _, result := range taskBundle.task.Spec.Results {
 		_, err := stringBuilder.WriteString(fmt.Sprintf("* **%v**: %v\n", result.Name, result.Description))
 		if err != nil {
 			return err
@@ -168,13 +168,13 @@ func generateResults(task *pipepinev1.Task, stringBuilder *strings.Builder) erro
 	return nil
 }
 
-func generateWorkspaces(task *pipepinev1.Task, stringBuilder *strings.Builder) error {
+func generateWorkspaces(taskBundle *TaskBundle, stringBuilder *strings.Builder) error {
 	_, err := stringBuilder.WriteString("## Workspaces\n")
 	if err != nil {
 		return err
 	}
 
-	for _, workspace := range task.Spec.Workspaces {
+	for _, workspace := range taskBundle.task.Spec.Workspaces {
 
 		var formatString string
 		if workspace.Optional {
@@ -197,13 +197,13 @@ func generateWorkspaces(task *pipepinev1.Task, stringBuilder *strings.Builder) e
 	return nil
 }
 
-func generateInputs(task *pipepinev1.Task, stringBuilder *strings.Builder) error {
+func generateInputs(taskBundle *TaskBundle, stringBuilder *strings.Builder) error {
 	_, err := stringBuilder.WriteString("## Parameters\n")
 	if err != nil {
 		return err
 	}
 
-	for _, param := range task.Spec.Params {
+	for _, param := range taskBundle.task.Spec.Params {
 
 		if param.Default != nil {
 			paramString, err := stringifyParam(param.Default)
@@ -232,8 +232,8 @@ func generateInputs(task *pipepinev1.Task, stringBuilder *strings.Builder) error
 	return nil
 }
 
-func generateDescription(task *pipepinev1.Task, stringBuilder *strings.Builder) error {
-	_, err := stringBuilder.WriteString(task.Spec.Description)
+func generateDescription(taskBundle *TaskBundle, stringBuilder *strings.Builder) error {
+	_, err := stringBuilder.WriteString(taskBundle.task.Spec.Description)
 	if err != nil {
 		return err
 	}
@@ -246,8 +246,8 @@ func generateDescription(task *pipepinev1.Task, stringBuilder *strings.Builder) 
 	return nil
 }
 
-func generateHeader(task *pipepinev1.Task, stringBuilder *strings.Builder) error {
-	_, err := stringBuilder.WriteString(fmt.Sprintf("# `%v`\n\n", task.Name))
+func generateHeader(taskBundle *TaskBundle, stringBuilder *strings.Builder) error {
+	_, err := stringBuilder.WriteString(fmt.Sprintf("# `%v`\n\n", taskBundle.task.Name))
 	if err != nil {
 		return err
 	}
